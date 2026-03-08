@@ -1,5 +1,6 @@
 require("dotenv").config();
 
+const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const {
@@ -9,6 +10,23 @@ const {
   Events,
   MessageFlags
 } = require("discord.js");
+
+const PORT = process.env.PORT || 10000;
+
+// Petit serveur HTTP pour Render + UptimeRobot
+const server = http.createServer((req, res) => {
+  if (req.url === "/health") {
+    res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+    return res.end("ok");
+  }
+
+  res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+  res.end("Bot Discord Minecraft en ligne");
+});
+
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`🌐 Serveur HTTP actif sur le port ${PORT}`);
+});
 
 const client = new Client({
   intents: [
