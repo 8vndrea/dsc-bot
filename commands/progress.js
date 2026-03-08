@@ -1,5 +1,6 @@
 const { SlashCommandBuilder, MessageFlags } = require("discord.js");
 const Groq = require("groq-sdk");
+const { run } = require("../db");
 
 const groq = new Groq({
   apiKey: process.env.GROQ_API_KEY
@@ -27,7 +28,7 @@ async function askQuestion(interaction, content, time = 300000) {
       userMessage,
       answer: userMessage.content
     };
-  } catch (error) {
+  } catch (_) {
     try {
       await questionMessage.delete();
     } catch (_) {}
@@ -36,10 +37,19 @@ async function askQuestion(interaction, content, time = 300000) {
   }
 }
 
+function safeParseProgressPayload(raw) {
+  try {
+    const cleaned = raw.trim();
+    return JSON.parse(cleaned);
+  } catch (_) {
+    return null;
+  }
+}
+
 module.exports = {
   data: new SlashCommandBuilder()
     .setName("progress")
-    .setDescription("Analyse votre progression Minecraft avec questions intelligentes"),
+    .setDescription("Analyse votre progression Minecraft et met à jour la mémoire du serveur"),
 
   async execute(interaction) {
     await interaction.reply({
@@ -53,10 +63,9 @@ module.exports = {
       const step1 = await askQuestion(
         interaction,
         "📌 **Décris-moi où vous en êtes sur le serveur Minecraft.**\n" +
-          "Exemple : base, villageois, Nether, farms, End, stuff, etc.\n\n" +
+          "Par exemple : base, stuff, villageois, Nether, forteresse, End, farms, dragon, etc.\n\n" +
           "Tu as **5 minutes** pour répondre."
       );
-
       messagesToDelete.push(step1.questionMessage, step1.userMessage);
 
       const followupGen = await groq.chat.completions.create({
@@ -66,33 +75,29 @@ module.exports = {
             role: "system",
             content:
               "Tu es un expert Minecraft Java vanilla. " +
-              "À partir d'une description d'avancement d'un serveur entre amis, " +
-              "tu dois poser exactement 2 questions de suivi très utiles et précises. " +
-              "Ces questions doivent aider à mieux évaluer la progression réelle du serveur. " +
-              "Les questions doivent être courtes, concrètes, pertinentes. " +
-              'Réponds STRICTEMENT au format JSON suivant : {"q1":"...","q2":"..."}'
+              "À partir d'une description de progression d'un serveur entre amis, " +
+              "tu dois poser exactement 2 questions de suivi très pertinentes. " +
+              'Réponds STRICTEMENT en JSON au format {"q1":"...","q2":"..."}.'
           },
           {
             role: "user",
-            content: `Voici la description actuelle du serveur : ${step1.answer}`
+            content: `Description actuelle du serveur : ${step1.answer}`
           }
         ],
         temperature: 0.4,
         max_tokens: 180
       });
 
+      let q1 = "Avez-vous déjà trouvé une forteresse du Nether ?";
+      let q2 = "Quelles farms ou grosses ressources automatiques avez-vous déjà ?";
+
       const rawQuestions =
         followupGen.choices?.[0]?.message?.content?.trim() || "";
 
-      let q1 = "Avez-vous déjà trouvé une forteresse du Nether ou localisé l'End ?";
-      let q2 = "Quelles farms ou ressources automatiques avez-vous déjà mises en place ?";
-
       try {
         const parsed = JSON.parse(rawQuestions);
-        if (parsed.q1 && parsed.q2) {
-          q1 = parsed.q1;
-          q2 = parsed.q2;
-        }
+        if (parsed.q1) q1 = parsed.q1;
+        if (parsed.q2) q2 = parsed.q2;
       } catch (_) {}
 
       const step2 = await askQuestion(
@@ -108,7 +113,7 @@ module.exports = {
       messagesToDelete.push(step3.questionMessage, step3.userMessage);
 
       const loadingMessage = await interaction.channel.send(
-        "🧠 J'analyse toutes vos réponses..."
+        "🧠 J'analyse vos réponses et je mets la mémoire à jour..."
       );
       messagesToDelete.push(loadingMessage);
 
@@ -119,15 +124,27 @@ module.exports = {
             role: "system",
             content:
               "Tu es un expert Minecraft Java vanilla. " +
-              "Tu aides un petit serveur entre amis à comprendre sa progression. " +
-              "Réponds uniquement en français. " +
-              "Analyse les réponses et produis une réponse utile, structurée, concrète. " +
-              "Format obligatoire :\n" +
-              "1. Situation actuelle\n" +
-              "2. Ce qu'il manque encore\n" +
-              "3. 3 prochaines priorités\n" +
-              "4. Objectif conseillé pour la prochaine session\n" +
-              "Reste centré sur survival vanilla Java."
+              "Tu analyses la progression d'un petit serveur entre amis. " +
+              "Tu dois répondre STRICTEMENT en JSON valide, sans texte avant ni après. " +
+              "Format obligatoire : " +
+              '{' +
+              '"discord_reply":"...",' +
+              '"memory":{' +
+              '"stage":"debut|milieu|nether|end|late",' +
+              '"has_nether":true,' +
+              '"has_fortress":false,' +
+              '"has_end_access":false,' +
+              '"killed_dragon":false,' +
+              '"farms":[{"name":"iron farm","status":"done"}],' +
+              '"notes":"...",' +
+              '"last_progress_summary":"..."' +
+              "}" +
+              "}. " +
+              "Le champ discord_reply doit contenir : " +
+              "1. Situation actuelle " +
+              "2. Ce qu'il manque encore " +
+              "3. 3 prochaines priorités " +
+              "4. Objectif conseillé pour la prochaine session."
           },
           {
             role: "user",
@@ -137,13 +154,62 @@ module.exports = {
               `Réponse à la question 2 (${q2}) : ${step3.answer}`
           }
         ],
-        temperature: 0.6,
-        max_tokens: 500
+        temperature: 0.5,
+        max_tokens: 900
       });
 
-      const finalAnswer =
-        finalCompletion.choices?.[0]?.message?.content?.trim() ||
-        "Je n'ai pas réussi à analyser correctement votre progression.";
+      const rawFinal =
+        finalCompletion.choices?.[0]?.message?.content?.trim() || "";
+
+      const parsed = safeParseProgressPayload(rawFinal);
+
+      if (!parsed || !parsed.memory || !parsed.discord_reply) {
+        throw new Error("INVALID_PROGRESS_JSON");
+      }
+
+      const memory = parsed.memory;
+
+      const farms = Array.isArray(memory.farms) ? memory.farms : [];
+
+      await run(
+        `
+        INSERT INTO server_memory (
+          guild_id,
+          stage,
+          has_nether,
+          has_fortress,
+          has_end_access,
+          killed_dragon,
+          farms,
+          notes,
+          last_progress_summary,
+          updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(guild_id)
+        DO UPDATE SET
+          stage = excluded.stage,
+          has_nether = excluded.has_nether,
+          has_fortress = excluded.has_fortress,
+          has_end_access = excluded.has_end_access,
+          killed_dragon = excluded.killed_dragon,
+          farms = excluded.farms,
+          notes = excluded.notes,
+          last_progress_summary = excluded.last_progress_summary,
+          updated_at = CURRENT_TIMESTAMP
+        `,
+        [
+          interaction.guildId,
+          memory.stage || "debut",
+          memory.has_nether ? 1 : 0,
+          memory.has_fortress ? 1 : 0,
+          memory.has_end_access ? 1 : 0,
+          memory.killed_dragon ? 1 : 0,
+          JSON.stringify(farms),
+          memory.notes || "",
+          memory.last_progress_summary || ""
+        ]
+      );
 
       for (const msg of messagesToDelete) {
         if (!msg) continue;
@@ -152,7 +218,9 @@ module.exports = {
         } catch (_) {}
       }
 
-      await interaction.channel.send(`📈 **Analyse de progression**\n\n${finalAnswer}`);
+      await interaction.channel.send(
+        `📈 **Analyse de progression**\n\n${parsed.discord_reply}`
+      );
     } catch (error) {
       console.error("Erreur /progress :", error);
 

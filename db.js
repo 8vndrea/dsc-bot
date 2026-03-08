@@ -38,6 +38,32 @@ db.serialize(() => {
       UNIQUE(guild_id, player_name)
     )
   `);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS server_memory (
+      guild_id TEXT PRIMARY KEY,
+      stage TEXT DEFAULT 'debut',
+      has_nether INTEGER DEFAULT 0,
+      has_fortress INTEGER DEFAULT 0,
+      has_end_access INTEGER DEFAULT 0,
+      killed_dragon INTEGER DEFAULT 0,
+      farms TEXT DEFAULT '[]',
+      notes TEXT DEFAULT '',
+      last_progress_summary TEXT DEFAULT '',
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS conversation_memory (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      guild_id TEXT NOT NULL,
+      channel_id TEXT NOT NULL,
+      role TEXT NOT NULL,
+      content TEXT NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
 });
 
 function run(query, params = []) {
