@@ -47,6 +47,35 @@ function formatConversationHistory(rows) {
     .join("\n");
 }
 
+function splitMessage(text, maxLength = 1900) {
+  const chunks = [];
+  let remaining = text;
+
+  while (remaining.length > maxLength) {
+    let slice = remaining.slice(0, maxLength);
+
+    const lastBreak = Math.max(
+      slice.lastIndexOf("\n"),
+      slice.lastIndexOf(". "),
+      slice.lastIndexOf("! "),
+      slice.lastIndexOf("? ")
+    );
+
+    if (lastBreak > 200) {
+      slice = remaining.slice(0, lastBreak + 1);
+    }
+
+    chunks.push(slice.trim());
+    remaining = remaining.slice(slice.length).trim();
+  }
+
+  if (remaining.length) {
+    chunks.push(remaining);
+  }
+
+  return chunks;
+}
+
 async function trimConversationMemory(guildId, channelId, maxMessages = 12) {
   const rows = await all(
     `
@@ -119,7 +148,8 @@ module.exports = {
               "Tu donnes des réponses concrètes, utiles, assez courtes. " +
               "Tu n'inventes pas. " +
               "Si une information dépend d'une version précise ou est incertaine, dis-le honnêtement. " +
-              "Tu restes centré sur survival vanilla Java sauf si l'utilisateur demande autre chose."
+              "Quand l'utilisateur rebondit sur une question précédente, utilise l'historique pour comprendre le contexte. " +
+              "Reste centré sur survival vanilla Java sauf si l'utilisateur demande autre chose."
           },
           {
             role: "system",
@@ -140,10 +170,6 @@ module.exports = {
         completion.choices?.[0]?.message?.content?.trim() ||
         "Je n'ai pas réussi à générer une réponse.";
 
-      await interaction.editReply(
-        `❓ **Question :** ${question}\n\n🧠 **Réponse :** ${answer}`
-      );
-
       await run(
         `
         INSERT INTO conversation_memory (guild_id, channel_id, role, content)
@@ -161,6 +187,15 @@ module.exports = {
       );
 
       await trimConversationMemory(guildId, channelId, 12);
+
+      const fullReply = `❓ **Question :** ${question}\n\n🧠 **Réponse :** ${answer}`;
+      const parts = splitMessage(fullReply);
+
+      await interaction.editReply(parts[0]);
+
+      for (let i = 1; i < parts.length; i++) {
+        await interaction.followUp(parts[i]);
+      }
     } catch (error) {
       console.error("Erreur Groq:", error);
 

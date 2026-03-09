@@ -45,6 +45,33 @@ function safeJsonParse(raw) {
   }
 }
 
+function splitMessage(text, maxLength = 1900) {
+  const chunks = [];
+  let remaining = text;
+
+  while (remaining.length > maxLength) {
+    let slice = remaining.slice(0, maxLength);
+
+    const lastBreak = Math.max(
+      slice.lastIndexOf("\n"),
+      slice.lastIndexOf(". "),
+      slice.lastIndexOf("! "),
+      slice.lastIndexOf("? ")
+    );
+
+    if (lastBreak > 200) {
+      slice = remaining.slice(0, lastBreak + 1);
+    }
+
+    chunks.push(slice.trim());
+    remaining = remaining.slice(slice.length).trim();
+  }
+
+  if (remaining.length) chunks.push(remaining);
+
+  return chunks;
+}
+
 function formatExistingMemory(row) {
   if (!row) {
     return "Aucune mémoire actuelle enregistrée.";
@@ -69,8 +96,88 @@ function formatExistingMemory(row) {
     `Dragon tué: ${row.killed_dragon ? "oui" : "non"}`,
     `Farms: ${farmsText}`,
     `Notes: ${row.notes || "aucune"}`,
-    `Dernier résumé: ${row.last_progress_summary || "aucun"}`
+    `Dernier résumé: ${row.last_progress_summary || "aucun"}`,
+    `Dernier objectif: ${row.last_objective || "aucun"}`
   ].join("\n");
+}
+
+function hasUsableMemory(row) {
+  if (!row) return false;
+
+  const hasText =
+    (row.notes && row.notes.trim().length > 10) ||
+    (row.last_progress_summary && row.last_progress_summary.trim().length > 10) ||
+    (row.last_objective && row.last_objective.trim().length > 10);
+
+  const hasFlags =
+    row.has_nether ||
+    row.has_fortress ||
+    row.has_end_access ||
+    row.killed_dragon ||
+    (row.stage && row.stage !== "debut");
+
+  return Boolean(hasText || hasFlags);
+}
+
+function normalizeYesNo(text) {
+  const v = text.trim().toLowerCase();
+
+  if (["oui", "o", "yes", "y", "ouais", "grave", "bien sur", "bien sûr"].includes(v)) {
+    return "yes";
+  }
+
+  if (["non", "n", "no", "nop", "pas du tout"].includes(v)) {
+    return "no";
+  }
+
+  return "unknown";
+}
+
+async function saveMemory(guildId, memory) {
+  const farms = Array.isArray(memory.farms) ? memory.farms : [];
+
+  await run(
+    `
+    INSERT INTO server_memory (
+      guild_id,
+      stage,
+      has_nether,
+      has_fortress,
+      has_end_access,
+      killed_dragon,
+      farms,
+      notes,
+      last_progress_summary,
+      last_objective,
+      updated_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    ON CONFLICT(guild_id)
+    DO UPDATE SET
+      stage = excluded.stage,
+      has_nether = excluded.has_nether,
+      has_fortress = excluded.has_fortress,
+      has_end_access = excluded.has_end_access,
+      killed_dragon = excluded.killed_dragon,
+      farms = excluded.farms,
+      notes = excluded.notes,
+      last_progress_summary = excluded.last_progress_summary,
+      last_objective = excluded.last_objective,
+      updated_at = CURRENT_TIMESTAMP
+    `,
+    [
+      guildId,
+      memory.stage || "debut",
+      memory.has_nether ? 1 : 0,
+      memory.has_fortress ? 1 : 0,
+      memory.has_end_access ? 1 : 0,
+      memory.killed_dragon ? 1 : 0,
+      JSON.stringify(farms),
+      memory.notes || "",
+      memory.last_progress_summary || "",
+      memory.last_objective || ""
+    ]
+  );
 }
 
 module.exports = {
@@ -92,16 +199,238 @@ module.exports = {
         [interaction.guildId]
       );
 
-      const existingMemoryText = formatExistingMemory(existingMemory);
+      const memoryText = formatExistingMemory(existingMemory);
+      const memoryExists = hasUsableMemory(existingMemory);
 
-      const step1 = await askQuestion(
+      // CAS 1 : aucune mémoire -> flow classique
+      if (!memoryExists) {
+        const step1 = await askQuestion(
+          interaction,
+          "📌 **Décris-moi où vous en êtes sur le serveur Minecraft.**\n" +
+            "Par exemple : base, stuff, villageois, Nether, forteresse, End, farms, dragon, etc.\n\n" +
+            "Tu as **5 minutes** pour répondre."
+        );
+        messagesToDelete.push(step1.questionMessage, step1.userMessage);
+
+        const followupGen = await groq.chat.completions.create({
+          model: "llama-3.3-70b-versatile",
+          messages: [
+            {
+              role: "system",
+              content:
+                "Tu es un expert Minecraft Java vanilla très expérimenté. " +
+                "À partir d'une description de progression d'un serveur entre amis, " +
+                "pose exactement 2 questions de suivi très ciblées, utiles et non génériques. " +
+                'Réponds STRICTEMENT en JSON : {"q1":"...","q2":"..."}.'
+            },
+            {
+              role: "user",
+              content: `Description actuelle du serveur : ${step1.answer}`
+            }
+          ],
+          temperature: 0.5,
+          max_tokens: 220
+        });
+
+        let q1 = "Avez-vous déjà trouvé une forteresse du Nether et récupéré des blaze rods ?";
+        let q2 = "Quelles farms vraiment utiles avez-vous déjà terminées ou presque terminées ?";
+
+        const rawQuestions =
+          followupGen.choices?.[0]?.message?.content?.trim() || "";
+
+        try {
+          const parsedQuestions = JSON.parse(rawQuestions);
+          if (parsedQuestions.q1) q1 = parsedQuestions.q1;
+          if (parsedQuestions.q2) q2 = parsedQuestions.q2;
+        } catch (_) {}
+
+        const step2 = await askQuestion(
+          interaction,
+          `❓ **Question 1 :** ${q1}\n\nTu as **5 minutes** pour répondre.`
+        );
+        messagesToDelete.push(step2.questionMessage, step2.userMessage);
+
+        const step3 = await askQuestion(
+          interaction,
+          `❓ **Question 2 :** ${q2}\n\nTu as **5 minutes** pour répondre.`
+        );
+        messagesToDelete.push(step3.questionMessage, step3.userMessage);
+
+        const loadingMessage = await interaction.channel.send(
+          "🧠 J'analyse vos réponses et je mets la mémoire à jour..."
+        );
+        messagesToDelete.push(loadingMessage);
+
+        const analysisCompletion = await groq.chat.completions.create({
+          model: "llama-3.3-70b-versatile",
+          messages: [
+            {
+              role: "system",
+              content:
+                "Tu es un expert Minecraft Java vanilla très expérimenté. " +
+                "Tu aides un petit serveur entre amis à comprendre sa progression réelle. " +
+                "Tu réponds uniquement en français. " +
+                "Tu dois produire une analyse utile, concrète, pertinente et pas générique. " +
+                "Format obligatoire :\n" +
+                "1. Situation actuelle\n" +
+                "2. Ce qu'il manque encore\n" +
+                "3. 3 prochaines priorités\n" +
+                "4. Objectif conseillé pour la prochaine session\n" +
+                "Sois concis, moins de 1400 caractères."
+            },
+            {
+              role: "user",
+              content:
+                `Réponse initiale : ${step1.answer}\n\n` +
+                `Réponse à la question 1 (${q1}) : ${step2.answer}\n\n` +
+                `Réponse à la question 2 (${q2}) : ${step3.answer}`
+            }
+          ],
+          temperature: 0.6,
+          max_tokens: 700
+        });
+
+        const discordReply =
+          analysisCompletion.choices?.[0]?.message?.content?.trim() ||
+          "Je n'ai pas réussi à analyser correctement votre progression.";
+
+        const memoryCompletion = await groq.chat.completions.create({
+          model: "llama-3.3-70b-versatile",
+          messages: [
+            {
+              role: "system",
+              content:
+                "Tu extrais une mémoire structurée d'un serveur Minecraft Java vanilla. " +
+                "Tu dois répondre STRICTEMENT en JSON valide, sans texte avant ni après. " +
+                "Format obligatoire : " +
+                '{' +
+                '"stage":"debut|milieu|nether|end|late",' +
+                '"has_nether":true,' +
+                '"has_fortress":false,' +
+                '"has_end_access":false,' +
+                '"killed_dragon":false,' +
+                '"farms":[{"name":"iron farm","status":"done|building|planned"}],' +
+                '"notes":"...",' +
+                '"last_progress_summary":"...",' +
+                '"last_objective":"..."' +
+                "}. " +
+                "Le champ last_objective doit être l'objectif principal le plus logique pour la prochaine session."
+            },
+            {
+              role: "user",
+              content:
+                `Réponse initiale : ${step1.answer}\n\n` +
+                `Réponse à la question 1 (${q1}) : ${step2.answer}\n\n` +
+                `Réponse à la question 2 (${q2}) : ${step3.answer}\n\n` +
+                `Analyse finale produite :\n${discordReply}`
+            }
+          ],
+          temperature: 0.2,
+          max_tokens: 500
+        });
+
+        const rawMemory =
+          memoryCompletion.choices?.[0]?.message?.content?.trim() || "";
+
+        const memory = safeJsonParse(rawMemory);
+
+        if (!memory) {
+          throw new Error("INVALID_MEMORY_JSON");
+        }
+
+        await saveMemory(interaction.guildId, memory);
+
+        for (const msg of messagesToDelete) {
+          if (!msg) continue;
+          try {
+            await msg.delete();
+          } catch (_) {}
+        }
+
+        const parts = splitMessage(`📈 **Analyse de progression**\n\n${discordReply}`);
+        for (const part of parts) {
+          await interaction.channel.send(part);
+        }
+        return;
+      }
+
+      // CAS 2 : mémoire existante -> on demande si ça a avancé
+      const step0 = await askQuestion(
         interaction,
-        "📌 **Décris-moi où vous en êtes sur le serveur Minecraft.**\n" +
-          "Par exemple : base, stuff, villageois, Nether, forteresse, End, farms, dragon, etc.\n\n" +
+        "📌 **Avez-vous avancé depuis la dernière fois ?**\n" +
+          "Réponds simplement par **oui** ou **non**.\n\n" +
           "Tu as **5 minutes** pour répondre."
       );
-      messagesToDelete.push(step1.questionMessage, step1.userMessage);
+      messagesToDelete.push(step0.questionMessage, step0.userMessage);
 
+      const yesNo = normalizeYesNo(step0.answer);
+
+      // Si non -> rappel des objectifs / priorités
+      if (yesNo === "no") {
+        const loadingMessage = await interaction.channel.send(
+          "🧠 Je rappelle les priorités à partir de votre mémoire..."
+        );
+        messagesToDelete.push(loadingMessage);
+
+        const reminderCompletion = await groq.chat.completions.create({
+          model: "llama-3.3-70b-versatile",
+          messages: [
+            {
+              role: "system",
+              content:
+                "Tu es un expert Minecraft Java vanilla pour un petit serveur entre amis. " +
+                "À partir de la mémoire actuelle, rappelle clairement les objectifs et priorités utiles. " +
+                "Réponds uniquement en français. " +
+                "Format obligatoire :\n" +
+                "1. Où vous en êtes\n" +
+                "2. Objectif principal à garder\n" +
+                "3. 2 priorités secondaires\n" +
+                "4. Pourquoi c'est toujours la meilleure direction\n" +
+                "Sois concret, pas générique, moins de 1200 caractères."
+            },
+            {
+              role: "user",
+              content: `Mémoire actuelle du serveur :\n${memoryText}`
+            }
+          ],
+          temperature: 0.4,
+          max_tokens: 500
+        });
+
+        const reminder =
+          reminderCompletion.choices?.[0]?.message?.content?.trim() ||
+          "Je n'ai pas réussi à rappeler les objectifs actuels.";
+
+        for (const msg of messagesToDelete) {
+          if (!msg) continue;
+          try {
+            await msg.delete();
+          } catch (_) {}
+        }
+
+        const parts = splitMessage(`📈 **Rappel de progression**\n\n${reminder}`);
+        for (const part of parts) {
+          await interaction.channel.send(part);
+        }
+        return;
+      }
+
+      // Si la réponse oui/non est ambiguë -> petite relance
+      let advancementText = "";
+      if (yesNo === "unknown") {
+        advancementText = step0.answer;
+      } else {
+        const step1 = await askQuestion(
+          interaction,
+          "✅ **En quoi avez-vous avancé depuis la dernière fois ?**\n" +
+            "Décris ce que vous avez concrètement fait : structures trouvées, farms terminées, dragon tué, stuff amélioré, etc.\n\n" +
+            "Tu as **5 minutes** pour répondre."
+        );
+        messagesToDelete.push(step1.questionMessage, step1.userMessage);
+        advancementText = step1.answer;
+      }
+
+      // Génère 2 questions de suivi précises à partir de la mémoire + avancée
       const followupGen = await groq.chat.completions.create({
         model: "llama-3.3-70b-versatile",
         messages: [
@@ -109,26 +438,24 @@ module.exports = {
             role: "system",
             content:
               "Tu es un expert Minecraft Java vanilla très expérimenté. " +
-              "Tu aides un petit serveur entre amis à évaluer sa progression réelle. " +
-              "À partir de la description du joueur et de la mémoire existante, " +
-              "pose exactement 2 questions de suivi très ciblées, non génériques, " +
-              "qui vont vraiment aider à mieux comprendre ce qu'il leur manque ensuite. " +
-              "Évite les questions trop larges. " +
-              'Réponds STRICTEMENT en JSON : {"q1":"...","q2":"..."}'
+              "Le serveur a déjà une mémoire existante. " +
+              "À partir de cette mémoire et des nouvelles avancées, pose exactement 2 questions de suivi très ciblées " +
+              "pour clarifier ce qui a vraiment changé et ce qui manque maintenant. " +
+              'Réponds STRICTEMENT en JSON : {"q1":"...","q2":"..."}.'
           },
           {
             role: "user",
             content:
-              `Mémoire actuelle du serveur :\n${existingMemoryText}\n\n` +
-              `Nouvelle description du joueur :\n${step1.answer}`
+              `Mémoire actuelle du serveur :\n${memoryText}\n\n` +
+              `Nouvelles avancées décrites :\n${advancementText}`
           }
         ],
         temperature: 0.5,
         max_tokens: 220
       });
 
-      let q1 = "Avez-vous déjà trouvé une forteresse du Nether et récupéré des blaze rods ?";
-      let q2 = "Quelles farms vraiment utiles avez-vous déjà terminées ou presque terminées ?";
+      let q1 = "Qu'est-ce que vous avez réellement terminé ou validé depuis la dernière fois ?";
+      let q2 = "Qu'est-ce qu'il vous manque encore pour la prochaine grande étape ?";
 
       const rawQuestions =
         followupGen.choices?.[0]?.message?.content?.trim() || "";
@@ -152,34 +479,34 @@ module.exports = {
       messagesToDelete.push(step3.questionMessage, step3.userMessage);
 
       const loadingMessage = await interaction.channel.send(
-        "🧠 J'analyse vos réponses et je mets la mémoire à jour..."
+        "🧠 J'analyse vos nouvelles avancées, je mets la mémoire à jour, puis je prépare la suite..."
       );
       messagesToDelete.push(loadingMessage);
 
-      // 1) Analyse libre pour avoir une meilleure réponse Discord
+      // Analyse libre
       const analysisCompletion = await groq.chat.completions.create({
         model: "llama-3.3-70b-versatile",
         messages: [
           {
             role: "system",
             content:
-              "Tu es un expert Minecraft Java vanilla très expérimenté. " +
-              "Tu aides un petit serveur entre amis à comprendre sa progression réelle. " +
-              "Tu réponds uniquement en français. " +
-              "Tu dois produire une analyse utile, concrète, pertinente et pas générique. " +
-              "Appuie-toi sur la mémoire existante et sur les réponses du joueur. " +
+              "Tu es un expert Minecraft Java vanilla pour un petit serveur entre amis. " +
+              "Le serveur a une progression déjà suivie en mémoire. " +
+              "Tu dois analyser les nouvelles avancées, féliciter brièvement, expliquer ce que ça change, " +
+              "puis proposer la suite la plus logique. " +
+              "Réponds uniquement en français. " +
               "Format obligatoire :\n" +
-              "1. Situation actuelle\n" +
-              "2. Ce qu'il manque encore\n" +
-              "3. 3 prochaines priorités\n" +
+              "1. Bravo / ce qui a avancé\n" +
+              "2. Ce que ça change dans la progression\n" +
+              "3. 3 nouvelles priorités\n" +
               "4. Objectif conseillé pour la prochaine session\n" +
-              "Reste centré sur survival vanilla Java."
+              "Réponse concrète, utile, moins de 1400 caractères."
           },
           {
             role: "user",
             content:
-              `Mémoire actuelle du serveur :\n${existingMemoryText}\n\n` +
-              `Réponse initiale : ${step1.answer}\n\n` +
+              `Mémoire actuelle du serveur :\n${memoryText}\n\n` +
+              `Avancées décrites : ${advancementText}\n\n` +
               `Réponse à la question 1 (${q1}) : ${step2.answer}\n\n` +
               `Réponse à la question 2 (${q2}) : ${step3.answer}`
           }
@@ -190,17 +517,18 @@ module.exports = {
 
       const discordReply =
         analysisCompletion.choices?.[0]?.message?.content?.trim() ||
-        "Je n'ai pas réussi à analyser correctement votre progression.";
+        "Je n'ai pas réussi à analyser correctement vos nouvelles avancées.";
 
-      // 2) Extraction mémoire séparée pour garder une bonne qualité
+      // Extraction mémoire en remplaçant les données obsolètes
       const memoryCompletion = await groq.chat.completions.create({
         model: "llama-3.3-70b-versatile",
         messages: [
           {
             role: "system",
             content:
-              "Tu extrais une mémoire structurée d'un serveur Minecraft Java vanilla. " +
-              "Tu dois répondre STRICTEMENT en JSON valide, sans texte avant ni après. " +
+              "Tu mets à jour la mémoire structurée d'un serveur Minecraft Java vanilla. " +
+              "Tu dois remplacer les informations obsolètes par les nouvelles. " +
+              "Tu réponds STRICTEMENT en JSON valide, sans texte avant ni après. " +
               "Format obligatoire : " +
               '{' +
               '"stage":"debut|milieu|nether|end|late",' +
@@ -210,19 +538,19 @@ module.exports = {
               '"killed_dragon":false,' +
               '"farms":[{"name":"iron farm","status":"done|building|planned"}],' +
               '"notes":"...",' +
-              '"last_progress_summary":"..."' +
+              '"last_progress_summary":"...",' +
+              '"last_objective":"..."' +
               "}. " +
-              "Le champ notes doit être court et utile. " +
-              "Le champ last_progress_summary doit résumer clairement l'état du serveur en 1 ou 2 phrases."
+              "Le champ last_objective doit contenir le prochain objectif principal conseillé, pas l'ancien."
           },
           {
             role: "user",
             content:
-              `Mémoire actuelle du serveur :\n${existingMemoryText}\n\n` +
-              `Réponse initiale : ${step1.answer}\n\n` +
+              `Ancienne mémoire :\n${memoryText}\n\n` +
+              `Avancées décrites : ${advancementText}\n\n` +
               `Réponse à la question 1 (${q1}) : ${step2.answer}\n\n` +
               `Réponse à la question 2 (${q2}) : ${step3.answer}\n\n` +
-              `Analyse finale produite :\n${discordReply}`
+              `Analyse finale :\n${discordReply}`
           }
         ],
         temperature: 0.2,
@@ -238,47 +566,7 @@ module.exports = {
         throw new Error("INVALID_MEMORY_JSON");
       }
 
-      const farms = Array.isArray(memory.farms) ? memory.farms : [];
-
-      await run(
-        `
-        INSERT INTO server_memory (
-          guild_id,
-          stage,
-          has_nether,
-          has_fortress,
-          has_end_access,
-          killed_dragon,
-          farms,
-          notes,
-          last_progress_summary,
-          updated_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-        ON CONFLICT(guild_id)
-        DO UPDATE SET
-          stage = excluded.stage,
-          has_nether = excluded.has_nether,
-          has_fortress = excluded.has_fortress,
-          has_end_access = excluded.has_end_access,
-          killed_dragon = excluded.killed_dragon,
-          farms = excluded.farms,
-          notes = excluded.notes,
-          last_progress_summary = excluded.last_progress_summary,
-          updated_at = CURRENT_TIMESTAMP
-        `,
-        [
-          interaction.guildId,
-          memory.stage || "debut",
-          memory.has_nether ? 1 : 0,
-          memory.has_fortress ? 1 : 0,
-          memory.has_end_access ? 1 : 0,
-          memory.killed_dragon ? 1 : 0,
-          JSON.stringify(farms),
-          memory.notes || "",
-          memory.last_progress_summary || ""
-        ]
-      );
+      await saveMemory(interaction.guildId, memory);
 
       for (const msg of messagesToDelete) {
         if (!msg) continue;
@@ -287,9 +575,10 @@ module.exports = {
         } catch (_) {}
       }
 
-      await interaction.channel.send(
-        `📈 **Analyse de progression**\n\n${discordReply}`
-      );
+      const parts = splitMessage(`📈 **Mise à jour de progression**\n\n${discordReply}`);
+      for (const part of parts) {
+        await interaction.channel.send(part);
+      }
     } catch (error) {
       console.error("Erreur /progress :", error);
 

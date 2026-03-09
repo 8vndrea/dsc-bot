@@ -50,6 +50,7 @@ db.serialize(() => {
       farms TEXT DEFAULT '[]',
       notes TEXT DEFAULT '',
       last_progress_summary TEXT DEFAULT '',
+      last_objective TEXT DEFAULT '',
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )
   `);
@@ -64,6 +65,18 @@ db.serialize(() => {
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )
   `);
+
+  db.run(
+    `
+    ALTER TABLE server_memory
+    ADD COLUMN last_objective TEXT DEFAULT ''
+    `,
+    err => {
+      if (err && !err.message.includes("duplicate column name")) {
+        console.error("Erreur ALTER TABLE last_objective:", err.message);
+      }
+    }
+  );
 });
 
 function run(query, params = []) {
